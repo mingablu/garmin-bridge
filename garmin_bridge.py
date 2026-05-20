@@ -1,6 +1,6 @@
 """
-Garmin Bridge v4 - Microservico que conecta Garmin Connect ao n8n.
-v4: Agenda usa get_workouts (metodo disponivel na lib 0.3.3).
+Garmin Bridge v5 - Microservico que conecta Garmin Connect ao n8n.
+v5: Calendário via API direta do Garmin (traz treinos do TrainingPeaks).
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -15,7 +15,7 @@ GARMIN_EMAIL = os.environ["GARMIN_EMAIL"]
 GARMIN_PASSWORD = os.environ["GARMIN_PASSWORD"]
 API_KEY = os.environ["BRIDGE_API_KEY"]
 
-app = FastAPI(title="Garmin Bridge", version="4.0")
+app = FastAPI(title="Garmin Bridge", version="5.0")
 _client = None
 
 
@@ -38,7 +38,7 @@ def _auth(api_key):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "4.0", "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "version": "5.0", "time": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/wellness/today")
@@ -84,28 +84,53 @@ def activities_recent(limit: int = 10, x_api_key: str = Header(None)):
 
 
 @app.get("/calendar/week")
-def get_workouts_week(x_api_key: str = Header(None)):
+def get_calendar_week(x_api_key: str = Header(None)):
     """
-    Retorna workouts salvos/programados no Garmin Connect.
-    get_calendar nao existe na lib — usando get_workouts como alternativa.
+    Calendário do Garmin via API direta (garth).
+    Traz treinos programados do TrainingPeaks e outros planos.
     """
     _auth(x_api_key)
     c = _get_client()
-    today = datetime.now().date()
-    week_end = today + timedelta(days=7)
+    now = datetime.now()
+    year = now.year
+    month = now.month
+
+    # Tenta API direta do calendario Garmin
+    errors = []
+
+    # Tentativa 1: connectapi direto
+    try:
+        data = c.connectapi(f"/calendar-service/year/{year}/month/{month}")
+        if data:
+            return {"source": "calendar-service", "year": year, "month": month, **data}
+    except Exception as e:
+        errors.append(f"connectapi: {e}")
+
+    # Tentativa 2: garth get direto
+    try:
+        resp = c.garth.get("connectapi", f"/calendar-service/year/{year}/month/{month}")
+        data = resp.json() if hasattr(resp, 'json') else resp
+        if data:
+            return {"source": "garth-calendar", "year": year, "month": month, **data}
+    except Exception as e:
+        errors.append(f"garth-calendar: {e}")
+
+    # Tentativa 3: endpoint alternativo
+    try:
+        data = c.connectapi(f"/wellness-service/wellness/calendarItems/{year}-{month:02d}-01/{year}-{month:02d}-31")
+        if data:
+            return {"source": "wellness-calendar", **data}
+    except Exception as e:
+        errors.append(f"wellness-calendar: {e}")
+
+    # Fallback: workouts salvos
     try:
         workouts = c.get_workouts(0, 30)
         return {
-            "from": today.isoformat(),
-            "to": week_end.isoformat(),
+            "source": "workouts-fallback",
             "workouts": workouts if isinstance(workouts, list) else [],
-            "total": len(workouts) if isinstance(workouts, list) else 0,
+            "errors": errors,
+            "note": "Calendario nao acessivel, retornando workouts salvos"
         }
     except Exception as e:
-        return {
-            "from": today.isoformat(),
-            "to": week_end.isoformat(),
-            "workouts": [],
-            "total": 0,
-            "error": str(e),
-        }
+        return {"source": "none", "workouts": [], "errors": errors + [str(e)]}
