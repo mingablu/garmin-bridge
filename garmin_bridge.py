@@ -1,6 +1,6 @@
 """
-Garmin Bridge v5 - Microservico que conecta Garmin Connect ao n8n.
-v5: Calendário via API direta do Garmin (traz treinos do TrainingPeaks).
+Garmin Bridge v6 - Microservico que conecta Garmin Connect ao n8n.
+v6: Calendário com mes 0-indexed (API Garmin) e endpoint connect.garmin.com correto.
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -15,7 +15,7 @@ GARMIN_EMAIL = os.environ["GARMIN_EMAIL"]
 GARMIN_PASSWORD = os.environ["GARMIN_PASSWORD"]
 API_KEY = os.environ["BRIDGE_API_KEY"]
 
-app = FastAPI(title="Garmin Bridge", version="5.0")
+app = FastAPI(title="Garmin Bridge", version="6.0")
 _client = None
 
 
@@ -38,15 +38,11 @@ def _auth(api_key):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "5.0", "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "version": "6.0", "time": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/wellness/today")
 def wellness_today(x_api_key: str = Header(None)):
-    """
-    Wellness do dia.
-    Sono/HRV buscados de ONTEM (Garmin armazena dados da noite na data anterior).
-    """
     _auth(x_api_key)
     c = _get_client()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -86,42 +82,54 @@ def activities_recent(limit: int = 10, x_api_key: str = Header(None)):
 @app.get("/calendar/week")
 def get_calendar_week(x_api_key: str = Header(None)):
     """
-    Calendário do Garmin via API direta (garth).
-    Traz treinos programados do TrainingPeaks e outros planos.
+    Calendario do Garmin via API direta.
+    IMPORTANTE: API Garmin usa mes 0-indexed (janeiro=0, maio=4, dezembro=11).
+    Traz treinos do TrainingPeaks sincronizados.
     """
     _auth(x_api_key)
     c = _get_client()
     now = datetime.now()
     year = now.year
-    month = now.month
-
-    # Tenta API direta do calendario Garmin
+    month_0indexed = now.month - 1  # Garmin: janeiro=0, maio=4, dezembro=11
     errors = []
 
-    # Tentativa 1: connectapi direto
+    # Tentativa 1: garth com "connect" (connect.garmin.com) - mais provavel
     try:
-        data = c.connectapi(f"/calendar-service/year/{year}/month/{month}")
+        resp = c.garth.get(
+            "connect",
+            f"/calendar-service/year/{year}/month/{month_0indexed}"
+        )
+        data = resp.json() if hasattr(resp, "json") else resp
         if data:
-            return {"source": "calendar-service", "year": year, "month": month, **data}
+            return {"source": "garth-connect", "year": year, "month_0idx": month_0indexed, **data}
     except Exception as e:
-        errors.append(f"connectapi: {e}")
+        errors.append(f"garth-connect: {e}")
 
-    # Tentativa 2: garth get direto
+    # Tentativa 2: connectapi com mes 0-indexed
     try:
-        resp = c.garth.get("connectapi", f"/calendar-service/year/{year}/month/{month}")
-        data = resp.json() if hasattr(resp, 'json') else resp
+        data = c.connectapi(f"/calendar-service/year/{year}/month/{month_0indexed}")
         if data:
-            return {"source": "garth-calendar", "year": year, "month": month, **data}
+            return {"source": "connectapi-0idx", "year": year, "month_0idx": month_0indexed, **data}
     except Exception as e:
-        errors.append(f"garth-calendar: {e}")
+        errors.append(f"connectapi-0idx: {e}")
 
-    # Tentativa 3: endpoint alternativo
+    # Tentativa 3: mes 1-indexed (caso API aceite ambos)
     try:
-        data = c.connectapi(f"/wellness-service/wellness/calendarItems/{year}-{month:02d}-01/{year}-{month:02d}-31")
+        data = c.connectapi(f"/calendar-service/year/{year}/month/{now.month}")
         if data:
-            return {"source": "wellness-calendar", **data}
+            return {"source": "connectapi-1idx", **data}
     except Exception as e:
-        errors.append(f"wellness-calendar: {e}")
+        errors.append(f"connectapi-1idx: {e}")
+
+    # Tentativa 4: endpoint alternativo de schedule
+    try:
+        start = now.strftime("%Y-%m-%d")
+        end = (now + timedelta(days=14)).strftime("%Y-%m-%d")
+        data = c.connectapi(f"/workout-service/schedule/{start}/{end}")
+        if data:
+            return {"source": "workout-schedule", "events": data if isinstance(data, list) else []}
+    except Exception as e:
+        errors.append(f"workout-schedule: {e}")
 
     # Fallback: workouts salvos
     try:
@@ -130,7 +138,6 @@ def get_calendar_week(x_api_key: str = Header(None)):
             "source": "workouts-fallback",
             "workouts": workouts if isinstance(workouts, list) else [],
             "errors": errors,
-            "note": "Calendario nao acessivel, retornando workouts salvos"
         }
     except Exception as e:
         return {"source": "none", "workouts": [], "errors": errors + [str(e)]}
